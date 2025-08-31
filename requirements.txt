@@ -16,3 +16,6 @@ ultralytics  # YOLOv8
 # Utils
 python-multipart  # required for file uploads in FastAPI
 pydantic
+requests  # NEW: needed for Open-Meteo live data fetching
+matplotlib
+seaborn
