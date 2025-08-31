@@ -19,3 +19,4 @@ pydantic
 requests  # NEW: needed for Open-Meteo live data fetching
 matplotlib
 seaborn
+tensorflow
