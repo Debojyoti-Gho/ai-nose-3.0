@@ -262,11 +262,17 @@ def chatbot_endpoint(query: Query):
         aq_data = fetch_air_quality(query.lat, query.lon)
         last_features = pd.DataFrame([{
             **aq_data,
+            "NDVI": 0.4,
+            "LST": 28.0,
+            "NightLights": 15.0,
+            "industrial_density_per_km2": 0.1,
+            "highway_density_km_per_km2": 0.5,
             "src_lat": query.lat,
             "src_lon": query.lon,
             "hour": datetime.now().hour,
             "dow": datetime.now().weekday()
         }])[FEATURES]
+
         X_scaled = scaler_X.transform(last_features)
 
         forecast_graph = generate_forecast_plot(forecasts)
@@ -304,11 +310,17 @@ async def chatbot_with_image(
         aq_data = fetch_air_quality(lat, lon)
         last_features = pd.DataFrame([{
             **aq_data,
+            "NDVI": 0.4,
+            "LST": 28.0,
+            "NightLights": 15.0,
+            "industrial_density_per_km2": 0.1,
+            "highway_density_km_per_km2": 0.5,
             "src_lat": lat,
             "src_lon": lon,
             "hour": datetime.now().hour,
             "dow": datetime.now().weekday()
         }])[FEATURES]
+
         X_scaled = scaler_X.transform(last_features)
 
         forecast_graph = generate_forecast_plot(forecasts)
