@@ -1,20 +1,20 @@
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import joblib, pandas as pd, numpy as np
 from datetime import datetime
-import shap, cv2
+import shap, cv2, io, base64
 from ultralytics import YOLO
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # ======================================================
 # 1. Load model + scalers
 # ======================================================
 MODEL_PATH = "models/ai_nose_xgb_model.joblib"
 SCALER_X_PATH = "models/scaler_X.pkl"
-
 
 model = joblib.load(MODEL_PATH)
 scaler_X = joblib.load(SCALER_X_PATH)
@@ -52,15 +52,14 @@ def detect_intent(question: str):
 yolo = YOLO("yolov8n.pt")  # lightweight pretrained YOLOv8
 
 def analyze_image(img_bytes):
-    # Save temporary file
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    # Run YOLO detection
+    # YOLO detection
     results = yolo.predict(img, verbose=False)
     objects = results[0].boxes.cls.cpu().numpy()
 
-    # Vehicle classes in COCO dataset
+    # Vehicle classes
     vehicle_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck
     vehicle_count = sum([obj in vehicle_classes for obj in objects])
 
@@ -69,7 +68,7 @@ def analyze_image(img_bytes):
     green_mask = (hsv[:,:,0] > 35) & (hsv[:,:,0] < 85)
     greenery_ratio = green_mask.sum() / (img.shape[0]*img.shape[1])
 
-    # Haze score (contrast proxy)
+    # Haze score
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     haze_score = gray.std()
 
@@ -106,8 +105,6 @@ def give_advice(pm25, intent, img_features=None):
 # 5. Forecast function (mock for demo)
 # ======================================================
 def forecast_future(lat, lon, horizon=3):
-    # In real system, fetch from your data pipeline
-    # Here we mock predictions
     times = pd.date_range(datetime.now(), periods=horizon, freq="H")
     forecasts = []
     for t in times:
@@ -116,9 +113,30 @@ def forecast_future(lat, lon, horizon=3):
     return forecasts
 
 # ======================================================
-# 6. FastAPI App
+# 6. Graph generation
 # ======================================================
-app = FastAPI(title="AI Nose 3.0 API", description="Multimodal Air Pollution Intelligence API", version="1.0")
+def generate_forecast_plot(forecasts):
+    times = [f["time"] for f in forecasts]
+    pm25 = [f["predicted"] for f in forecasts]
+
+    plt.figure(figsize=(6,3))
+    sns.lineplot(x=times, y=pm25, marker="o")
+    plt.xticks(rotation=45, ha="right")
+    plt.title("PM2.5 Forecast")
+    plt.ylabel("µg/m³")
+    plt.xlabel("Time")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+# ======================================================
+# 7. FastAPI App
+# ======================================================
+app = FastAPI(title="AI Nose 3.0 API", description="Multimodal Air Pollution Intelligence API with Graphs", version="1.1")
 
 class Query(BaseModel):
     lat: float
@@ -143,7 +161,10 @@ def chatbot_endpoint(query: Query):
                 "advice": advice
             })
 
-        return {"status": "ok", "intent": intent, "results": results}
+        # Add graph
+        graph_b64 = generate_forecast_plot(forecasts)
+
+        return {"status": "ok", "intent": intent, "results": results, "forecast_graph": graph_b64}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -156,11 +177,9 @@ async def chatbot_with_image(
     file: UploadFile = File(...)
 ):
     try:
-        # Extract features from image
         img_bytes = await file.read()
         img_features = analyze_image(img_bytes)
 
-        # Run normal forecast
         intent = detect_intent(question) if question else "general"
         forecasts = forecast_future(lat, lon, horizon=horizon)
 
@@ -168,8 +187,8 @@ async def chatbot_with_image(
         for f in forecasts:
             pm25 = f["predicted"]
             advice = give_advice(pm25, intent, img_features)
-
             narrative = f["narrative"] + f" | 📷 Image analysis: {img_features}"
+
             results.append({
                 "time": f["time"],
                 "pm25": pm25,
@@ -177,12 +196,15 @@ async def chatbot_with_image(
                 "advice": advice
             })
 
-        return {"status": "ok", "intent": intent, "img_features": img_features, "results": results}
+        # Add graph
+        graph_b64 = generate_forecast_plot(forecasts)
+
+        return {"status": "ok", "intent": intent, "img_features": img_features, "results": results, "forecast_graph": graph_b64}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 # ======================================================
-# 7. Run server
+# 8. Run server
 # ======================================================
 if __name__ == "__main__":
     uvicorn.run("ai_nose_api:app", host="0.0.0.0", port=8000, reload=True)
