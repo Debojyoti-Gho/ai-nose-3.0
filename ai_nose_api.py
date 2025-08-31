@@ -321,4 +321,5 @@ async def chatbot_with_image(
 # 8. Run server
 # ======================================================
 if __name__ == "__main__":
-    uvicorn.run("ai_nose_api:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))  # use Render's $PORT if available
+    uvicorn.run("ai_nose_api:app", host="0.0.0.0", port=port)
