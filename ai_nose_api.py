@@ -317,6 +317,11 @@ async def chatbot_with_image(
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
+
 # ======================================================
 # 8. Run server
 # ======================================================
