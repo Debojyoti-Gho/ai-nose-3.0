@@ -20,7 +20,13 @@ model = joblib.load(MODEL_PATH)
 scaler_X = joblib.load(SCALER_X_PATH)
 explainer = shap.Explainer(model)
 
-FEATURES = ["pm10", "co", "no2", "so2", "src_lat", "src_lon", "hour", "dow"]
+# Use same feature order as training (X_cols from Colab)
+FEATURES = [
+    "pm10","co","no2","so2","o3","temp","rh","wind_speed","pressure",
+    "NDVI","LST","NightLights","traffic_proxy",
+    "industrial_density_per_km2","highway_density_km_per_km2",
+    "src_lat","src_lon","hour","dow"
+]
 
 # ======================================================
 # 2. NLP intent detection
@@ -105,24 +111,38 @@ def give_advice(pm25, intent, img_features=None):
 def fetch_air_quality(lat, lon):
     url = (
         f"https://air-quality-api.open-meteo.com/v1/air-quality?"
-        f"latitude={lat}&longitude={lon}&hourly=pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide&forecast_days=1"
+        f"latitude={lat}&longitude={lon}&"
+        f"hourly=pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,"
+        f"ozone,temperature_2m,relative_humidity_2m,wind_speed_10m,pressure_msl&forecast_days=1"
     )
-    resp = requests.get(url).json()
     try:
+        resp = requests.get(url, timeout=20).json()
+        h = resp["hourly"]
         return {
-            "pm10": resp["hourly"]["pm10"][0],
-            "co": resp["hourly"]["carbon_monoxide"][0],
-            "no2": resp["hourly"]["nitrogen_dioxide"][0],
-            "so2": resp["hourly"]["sulphur_dioxide"][0]
+            "pm10": h["pm10"][0],
+            "co": h["carbon_monoxide"][0],
+            "no2": h["nitrogen_dioxide"][0],
+            "so2": h["sulphur_dioxide"][0],
+            "o3": h.get("ozone",[np.nan])[0],
+            "temp": h.get("temperature_2m",[np.nan])[0],
+            "rh": h.get("relative_humidity_2m",[np.nan])[0],
+            "wind_speed": h.get("wind_speed_10m",[np.nan])[0],
+            "pressure": h.get("pressure_msl",[np.nan])[0]
         }
     except Exception:
-        # fallback to random if API fails
+        # fallback random if API fails
         return {
-            "pm10": np.random.uniform(10, 100),
-            "co": np.random.uniform(0.1, 1.0),
-            "no2": np.random.uniform(5, 50),
-            "so2": np.random.uniform(2, 20)
+            "pm10": np.random.uniform(10,100),
+            "co": np.random.uniform(0.1,1.0),
+            "no2": np.random.uniform(5,50),
+            "so2": np.random.uniform(2,20),
+            "o3": np.random.uniform(5,50),
+            "temp": np.random.uniform(10,35),
+            "rh": np.random.uniform(20,90),
+            "wind_speed": np.random.uniform(0,10),
+            "pressure": np.random.uniform(950,1050)
         }
+
 
 def forecast_future(lat, lon, horizon=3):
     now = datetime.now()
@@ -134,11 +154,19 @@ def forecast_future(lat, lon, horizon=3):
 
         features = {
             **aq_data,
+            # placeholders for satellite/OSM — replace later with real GEE/Overpass
+            "NDVI": 0.4,
+            "LST": 28.0,
+            "NightLights": 15.0,
+            "traffic_proxy": 1.0,
+            "industrial_density_per_km2": 0.1,
+            "highway_density_km_per_km2": 0.5,
             "src_lat": lat,
             "src_lon": lon,
             "hour": t.hour,
             "dow": t.weekday()
         }
+
 
         X = pd.DataFrame([features])[FEATURES]
         X_scaled = scaler_X.transform(X)
