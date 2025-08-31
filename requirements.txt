@@ -1,0 +1,18 @@
+fastapi
+uvicorn[standard]
+
+# Core ML / Data
+numpy
+pandas
+scikit-learn
+joblib
+xgboost
+shap
+
+# Vision
+opencv-python-headless
+ultralytics  # YOLOv8
+
+# Utils
+python-multipart  # required for file uploads in FastAPI
+pydantic
