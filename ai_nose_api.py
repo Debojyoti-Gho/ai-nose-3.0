@@ -12,8 +12,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 # ======================================================
 # 1. Load model + scalers
 # ======================================================
-MODEL_PATH = "ai_nose_xgb_model.joblib"
-SCALER_X_PATH = "scaler_X.pkl"
+MODEL_PATH = "models/ai_nose_xgb_model.joblib"
+SCALER_X_PATH = "models/scaler_X.pkl"
+
 
 model = joblib.load(MODEL_PATH)
 scaler_X = joblib.load(SCALER_X_PATH)
