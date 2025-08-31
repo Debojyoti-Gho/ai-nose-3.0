@@ -113,7 +113,7 @@ def forecast_future(lat, lon, horizon=3):
     return forecasts
 
 # ======================================================
-# 6. Graph generation
+# 6. Graph + SHAP generation
 # ======================================================
 def generate_forecast_plot(forecasts):
     times = [f["time"] for f in forecasts]
@@ -134,14 +134,12 @@ def generate_forecast_plot(forecasts):
     return base64.b64encode(buf.read()).decode("utf-8")
 
 def generate_shap_plot(forecasts):
-    # Take the first forecast point to explain
     sample = np.array([forecasts[0]["predicted"]]).reshape(1, -1)
     try:
         shap_vals = explainer(sample)
         vals = shap_vals.values[0]
         feats = explainer.feature_names if explainer.feature_names else [f"f{i}" for i in range(len(vals))]
 
-        # Top 5 drivers
         idx = np.argsort(np.abs(vals))[-5:]
         top_feats = [feats[i] for i in idx]
         top_vals = [vals[i] for i in idx]
@@ -160,10 +158,27 @@ def generate_shap_plot(forecasts):
     except Exception:
         return None
 
+def generate_shap_explanations(forecasts):
+    """Return textual top-5 SHAP explanations."""
+    sample = np.array([forecasts[0]["predicted"]]).reshape(1, -1)
+    try:
+        shap_vals = explainer(sample)
+        vals = shap_vals.values[0]
+        feats = explainer.feature_names if explainer.feature_names else [f"f{i}" for i in range(len(vals))]
+
+        idx = np.argsort(np.abs(vals))[-5:]
+        explanations = []
+        for i in idx[::-1]:
+            impact = "increased" if vals[i] > 0 else "reduced"
+            explanations.append(f"{feats[i]} {impact} PM2.5 by {abs(vals[i]):.2f}")
+        return explanations
+    except Exception:
+        return ["Explanation unavailable"]
+
 # ======================================================
 # 7. FastAPI App
 # ======================================================
-app = FastAPI(title="AI Nose 3.0 API", description="Multimodal Air Pollution Intelligence API with Graphs + SHAP", version="1.2")
+app = FastAPI(title="AI Nose 3.0 API", description="Multimodal Air Pollution Intelligence API with Graphs + SHAP", version="1.3")
 
 class Query(BaseModel):
     lat: float
@@ -188,12 +203,15 @@ def chatbot_endpoint(query: Query):
                 "advice": advice
             })
 
-        # Graphs
+        # Graphs + explanations
         forecast_graph = generate_forecast_plot(forecasts)
         shap_graph = generate_shap_plot(forecasts)
+        shap_explanations = generate_shap_explanations(forecasts)
 
         return {"status": "ok", "intent": intent, "results": results,
-                "forecast_graph": forecast_graph, "shap_graph": shap_graph}
+                "forecast_graph": forecast_graph,
+                "shap_graph": shap_graph,
+                "shap_explanations": shap_explanations}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -216,7 +234,7 @@ async def chatbot_with_image(
         for f in forecasts:
             pm25 = f["predicted"]
             advice = give_advice(pm25, intent, img_features)
-            narrative = f["narrative"] + f" | 📷 Image analysis: {}".format(img_features)
+            narrative = f["narrative"] + f" | 📷 Image analysis: {img_features}"
 
             results.append({
                 "time": f["time"],
@@ -225,12 +243,16 @@ async def chatbot_with_image(
                 "advice": advice
             })
 
-        # Graphs
+        # Graphs + explanations
         forecast_graph = generate_forecast_plot(forecasts)
         shap_graph = generate_shap_plot(forecasts)
+        shap_explanations = generate_shap_explanations(forecasts)
 
         return {"status": "ok", "intent": intent, "img_features": img_features,
-                "results": results, "forecast_graph": forecast_graph, "shap_graph": shap_graph}
+                "results": results,
+                "forecast_graph": forecast_graph,
+                "shap_graph": shap_graph,
+                "shap_explanations": shap_explanations}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
