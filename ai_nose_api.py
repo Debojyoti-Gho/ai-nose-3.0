@@ -280,6 +280,12 @@ def chatbot_endpoint(query: Query):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
+
 @app.post("/chatbot_with_image")
 async def chatbot_with_image(
     lat: float = Form(...),
@@ -317,10 +323,6 @@ async def chatbot_with_image(
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
-@app.get("/")
-def health_check():
-    return {"status": "ok"}
 
 # ======================================================
 # 8. Run server
