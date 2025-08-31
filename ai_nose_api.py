@@ -133,10 +133,37 @@ def generate_forecast_plot(forecasts):
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("utf-8")
 
+def generate_shap_plot(forecasts):
+    # Take the first forecast point to explain
+    sample = np.array([forecasts[0]["predicted"]]).reshape(1, -1)
+    try:
+        shap_vals = explainer(sample)
+        vals = shap_vals.values[0]
+        feats = explainer.feature_names if explainer.feature_names else [f"f{i}" for i in range(len(vals))]
+
+        # Top 5 drivers
+        idx = np.argsort(np.abs(vals))[-5:]
+        top_feats = [feats[i] for i in idx]
+        top_vals = [vals[i] for i in idx]
+
+        plt.figure(figsize=(5,3))
+        sns.barplot(x=top_vals, y=top_feats, palette="coolwarm")
+        plt.title("Top Feature Drivers")
+        plt.xlabel("SHAP contribution")
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        plt.close()
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("utf-8")
+    except Exception:
+        return None
+
 # ======================================================
 # 7. FastAPI App
 # ======================================================
-app = FastAPI(title="AI Nose 3.0 API", description="Multimodal Air Pollution Intelligence API with Graphs", version="1.1")
+app = FastAPI(title="AI Nose 3.0 API", description="Multimodal Air Pollution Intelligence API with Graphs + SHAP", version="1.2")
 
 class Query(BaseModel):
     lat: float
@@ -161,10 +188,12 @@ def chatbot_endpoint(query: Query):
                 "advice": advice
             })
 
-        # Add graph
-        graph_b64 = generate_forecast_plot(forecasts)
+        # Graphs
+        forecast_graph = generate_forecast_plot(forecasts)
+        shap_graph = generate_shap_plot(forecasts)
 
-        return {"status": "ok", "intent": intent, "results": results, "forecast_graph": graph_b64}
+        return {"status": "ok", "intent": intent, "results": results,
+                "forecast_graph": forecast_graph, "shap_graph": shap_graph}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -187,7 +216,7 @@ async def chatbot_with_image(
         for f in forecasts:
             pm25 = f["predicted"]
             advice = give_advice(pm25, intent, img_features)
-            narrative = f["narrative"] + f" | 📷 Image analysis: {img_features}"
+            narrative = f["narrative"] + f" | 📷 Image analysis: {}".format(img_features)
 
             results.append({
                 "time": f["time"],
@@ -196,10 +225,12 @@ async def chatbot_with_image(
                 "advice": advice
             })
 
-        # Add graph
-        graph_b64 = generate_forecast_plot(forecasts)
+        # Graphs
+        forecast_graph = generate_forecast_plot(forecasts)
+        shap_graph = generate_shap_plot(forecasts)
 
-        return {"status": "ok", "intent": intent, "img_features": img_features, "results": results, "forecast_graph": graph_b64}
+        return {"status": "ok", "intent": intent, "img_features": img_features,
+                "results": results, "forecast_graph": forecast_graph, "shap_graph": shap_graph}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
