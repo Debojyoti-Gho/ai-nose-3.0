@@ -23,10 +23,9 @@ explainer = shap.Explainer(model)
 # Use same feature order as training (X_cols from Colab)
 FEATURES = [
     "pm10","co","no2","so2","o3","temp","rh","wind_speed","pressure",
-    "NDVI","LST","NightLights","traffic_proxy",
-    "industrial_density_per_km2","highway_density_km_per_km2",
-    "src_lat","src_lon","hour","dow"
+    "NDVI","LST","NightLights","industrial_density_per_km2","highway_density_km_per_km2"
 ]
+
 
 # ======================================================
 # 2. NLP intent detection
