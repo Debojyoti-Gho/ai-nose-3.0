@@ -1,25 +1,34 @@
+# ai_nose_api.py
 import os
+import asyncio
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form
 from pydantic import BaseModel
 import joblib, pandas as pd, numpy as np
 from datetime import datetime, timedelta
-import shap, cv2, io, base64, requests
+import io, base64, requests
+import shap, cv2  # keep imports but heavy objects will load lazily
+# Important: set non-GUI backend before importing pyplot
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
 from ultralytics import YOLO
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 # ======================================================
-# 1. Load model + scalers
+# 0. Lazy-loaded heavy globals (replaces top-level blocking loads)
 # ======================================================
 MODEL_PATH = "models/ai_nose_xgb_model.joblib"
 SCALER_X_PATH = "models/scaler_X.pkl"
+YOLO_WEIGHTS = "yolov8n.pt"
 
-model = joblib.load(MODEL_PATH)
-scaler_X = joblib.load(SCALER_X_PATH)
-explainer = shap.Explainer(model)
+model = None
+scaler_X = None
+explainer = None
+yolo = None
+_resources_loading_error = None  # store any exception raised during loading
 
 # Use same feature order as training (X_cols from Colab)
 FEATURES = [
@@ -27,9 +36,8 @@ FEATURES = [
     "NDVI","LST","NightLights","industrial_density_per_km2","highway_density_km_per_km2"
 ]
 
-
 # ======================================================
-# 2. NLP intent detection
+# 1. NLP intent detection
 # ======================================================
 INTENTS = {
     "housing": ["Should I build a house here?", "Is this location good for living?", "residential zone safe?", "Can I live here?"],
@@ -55,19 +63,13 @@ def detect_intent(question: str):
     return intent_labels[best_idx]
 
 # ======================================================
-# 3. Image analysis (YOLO + OpenCV) - expanded
+# 2. Image analysis (YOLO + OpenCV) - helpers (unchanged)
 # ======================================================
-yolo = YOLO("yolov8n.pt")
-
-# Heuristic helpers for fire/smoke/bright flashes/dust
 def detect_fire_color_regions(img, min_area=150, saturation_thr=120, value_thr=150):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower1 = np.array([0, saturation_thr, value_thr])
-    upper1 = np.array([30, 255, 255])
-    lower2 = np.array([160, saturation_thr, value_thr])
-    upper2 = np.array([179, 255, 255])
-    m1 = cv2.inRange(hsv, lower1, upper1)
-    m2 = cv2.inRange(hsv, lower2, upper2)
+    lower1 = np.array([0, saturation_thr, value_thr]); upper1 = np.array([30, 255, 255])
+    lower2 = np.array([160, saturation_thr, value_thr]); upper2 = np.array([179, 255, 255])
+    m1 = cv2.inRange(hsv, lower1, upper1); m2 = cv2.inRange(hsv, lower2, upper2)
     mask = cv2.bitwise_or(m1, m2)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -100,10 +102,8 @@ def detect_bright_flashes(img, small_area=(8, 300), intensity_thresh=245):
     return len(smalls), th
 
 def detect_dust_regions(img, min_area=500):
-    # heuristic: tan-ish color + texture
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l, a, b = cv2.split(lab)
-    # dust often high in 'b' channel (yellow-blue) and medium saturation
     candidate = ((b > 150) & (l > 80)).astype('uint8') * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15,15))
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -116,12 +116,13 @@ def analyze_image(img_bytes):
     """
     Returns a comprehensive analysis dictionary including:
       - detections (YOLO boxes)
-      - detections_by_label (counts)
-      - per-class counts for key classes (vehicle/truck/bus/motorbike)
-      - heuristic masks: smoke_frac, fire_frac, dust_frac, bright_flashes_count
-      - cooking indicators, brick_kiln, smokestack counts (if detected by YOLO)
-      - annotated_image_b64
+      - heuristic masks and annotated image
+    Requires 'yolo' to be loaded; raises RuntimeError if not ready.
     """
+    global yolo
+    if yolo is None:
+        raise RuntimeError("YOLO model not loaded yet. Try again later or check /health.")
+
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
@@ -217,26 +218,23 @@ def analyze_image(img_bytes):
 
     # overlay masks lightly (optional): smoke in gray, fire in orange, dust in tan
     try:
-        # convert single channel masks to 3-channel for overlay
         if smoke_mask is not None:
             sm_rgb = cv2.cvtColor(smoke_mask, cv2.COLOR_GRAY2BGR)
             annotated = cv2.addWeighted(annotated, 1.0, (sm_rgb // 2), 0.25, 0)
         if fire_mask is not None:
             fm = (fire_mask > 0).astype('uint8') * 255
             fm_rgb = cv2.cvtColor(fm, cv2.COLOR_GRAY2BGR)
-            # paint fire mask using orange color
             orange = np.zeros_like(annotated)
-            orange[:,:,2] = fm  # red channel
-            orange[:,:,1] = (fm * 0.6).astype('uint8')  # green
+            orange[:,:,2] = fm
+            orange[:,:,1] = (fm * 0.6).astype('uint8')
             annotated = cv2.addWeighted(annotated, 1.0, orange, 0.25, 0)
         if dust_mask is not None:
             dm = (dust_mask > 0).astype('uint8') * 255
             brown = np.zeros_like(annotated)
-            brown[:,:,2] = (dm * 0.9).astype('uint8')  # hint of red/yellow
+            brown[:,:,2] = (dm * 0.9).astype('uint8')
             brown[:,:,1] = (dm * 0.7).astype('uint8')
             annotated = cv2.addWeighted(annotated, 1.0, brown, 0.12, 0)
     except Exception:
-        # overlay is optional; proceed if fails
         pass
 
     # Draw boxes + labels
@@ -250,13 +248,11 @@ def analyze_image(img_bytes):
         cv2.rectangle(annotated, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), (0,255,255), -1)
         cv2.putText(annotated, label, (x1+3, max(4, y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1, cv2.LINE_AA)
 
-    # Header with many quick stats
     header = (f"V:{vehicle_count} C:{car_count} T:{truck_count} M:{motorbike_count} "
               f"Smoke:{smoke_mask_frac:.3f} Fire:{fire_mask_frac:.3f} Dust:{dust_mask_frac:.3f}")
     cv2.rectangle(annotated, (0,0), (w, 36), (0,0,0), -1)
     cv2.putText(annotated, header, (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
 
-    # encode annotated image to base64
     _, buf = cv2.imencode('.png', annotated)
     annotated_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
 
@@ -290,10 +286,9 @@ def analyze_image(img_bytes):
         "annotated_image_b64": annotated_b64
     }
 
-# --- Helper: image summary considering many detections ---
+# --- Helper: summary & image_to_adjustment (unchanged) ---
 def image_summary_from_features(img_features, max_items=4):
     parts = []
-    # strong signals first
     if img_features.get("open_burn_detected"):
         parts.append("Open burning detected — strong local source of particulate emissions.")
     if img_features.get("smoke_detected"):
@@ -302,7 +297,6 @@ def image_summary_from_features(img_features, max_items=4):
         parts.append("Flame-like regions detected — active combustion present.")
     if img_features.get("firecracker_like"):
         parts.append("Bright small flashes + smoke — fireworks or firecrackers likely.")
-    # vehicles & industrial
     vc = img_features.get("vehicle_count", 0)
     if vc > 0:
         parts.append(f"{vc} vehicle(s) visible — traffic emissions likely.")
@@ -314,7 +308,6 @@ def image_summary_from_features(img_features, max_items=4):
         parts.append("Construction/dust activity detected — coarse particulate contribution.")
     if img_features.get("cooking_count", 0) > 0:
         parts.append("Cooking/food stalls visible — localized PM and VOCs possible.")
-    # greenery
     gr = img_features.get("greenery_ratio", 0.0)
     if gr < 0.15:
         parts.append(f"Low greenery ({gr:.2f}) — limited natural mitigation.")
@@ -324,13 +317,7 @@ def image_summary_from_features(img_features, max_items=4):
     summary = " ".join(parts[:max_items])
     return f"{summary} {suggestion}"
 
-# --- Helper: map a rich set of image features to a numeric µg/m³ adjustment ---
 def image_to_adjustment(img_features):
-    """
-    Conservative heuristic mapping many visual signals -> µg/m³ adjustment.
-    Tunable; recommended retraining with these features for principled integration.
-    """
-    # Extract features with sensible defaults
     vc = float(img_features.get("vehicle_count", 0))
     truck = float(img_features.get("truck_count", 0))
     bus = float(img_features.get("bus_count", 0))
@@ -346,9 +333,8 @@ def image_to_adjustment(img_features):
     bright = float(img_features.get("bright_flash_count", 0))
     greenery = float(img_features.get("greenery_ratio", 0.0))
 
-    # Normalize counts to avoid large raw values
-    vc_norm = vc / 10.0           # per 10 vehicles
-    truck_norm = truck / 2.0      # each 2 trucks ~ 1 unit
+    vc_norm = vc / 10.0
+    truck_norm = truck / 2.0
     bus_norm = bus / 2.0
     motor_norm = motor / 10.0
     brick_norm = brick / 1.0
@@ -357,7 +343,6 @@ def image_to_adjustment(img_features):
     cooking_norm = cooking / 2.0
     bright_norm = bright / 1.0
 
-    # Weights (conservative). These can be tuned with validation data.
     W = {
         "vc": 0.6,
         "truck": 1.2,
@@ -391,15 +376,12 @@ def image_to_adjustment(img_features):
     score += W["bright"] * bright_norm
     score += W["greenery"] * greenery
 
-    # Convert score -> µg/m3 adjustment using conservative multiplier
     adjustment = score * 0.28
-
-    # Clip to safe bounds to avoid huge swings
     adjustment = float(np.clip(adjustment, -25.0, 120.0))
     return round(adjustment, 2)
 
 # ======================================================
-# 4. Advice logic
+# 3. Advice logic (unchanged)
 # ======================================================
 def give_advice(pm25, intent, img_features=None):
     if intent == "housing":
@@ -422,7 +404,7 @@ def give_advice(pm25, intent, img_features=None):
         else: return "🚨 Very hazardous."
 
 # ======================================================
-# 5. Forecast with Open-Meteo API
+# 4. Forecast with Open-Meteo API (unchanged except fallback)
 # ======================================================
 def fetch_air_quality(lat, lon):
     url = (
@@ -446,21 +428,29 @@ def fetch_air_quality(lat, lon):
             "pressure": h.get("pressure_msl",[np.nan])[0]
         }
     except Exception:
-        # fallback random if API fails
         return {
-            "pm10": np.random.uniform(10,100),
-            "co": np.random.uniform(0.1,1.0),
-            "no2": np.random.uniform(5,50),
-            "so2": np.random.uniform(2,20),
-            "o3": np.random.uniform(5,50),
-            "temp": np.random.uniform(10,35),
-            "rh": np.random.uniform(20,90),
-            "wind_speed": np.random.uniform(0,10),
-            "pressure": np.random.uniform(950,1050)
+            "pm10": float(np.random.uniform(10,100)),
+            "co": float(np.random.uniform(0.1,1.0)),
+            "no2": float(np.random.uniform(5,50)),
+            "so2": float(np.random.uniform(2,20)),
+            "o3": float(np.random.uniform(5,50)),
+            "temp": float(np.random.uniform(10,35)),
+            "rh": float(np.random.uniform(20,90)),
+            "wind_speed": float(np.random.uniform(0,10)),
+            "pressure": float(np.random.uniform(950,1050))
         }
 
-
 def forecast_future(lat, lon, horizon=3):
+    # If model/scaler not loaded yet, return fallback quick predictions
+    if model is None or scaler_X is None:
+        now = datetime.now()
+        forecasts = []
+        for i in range(horizon):
+            t = now + timedelta(hours=i)
+            forecasts.append({"time": str(t), "predicted": float(np.random.uniform(20,80)),
+                              "narrative": "Fallback forecast (model still loading)"})
+        return forecasts
+
     now = datetime.now()
     forecasts = []
 
@@ -470,7 +460,6 @@ def forecast_future(lat, lon, horizon=3):
 
         features = {
             **aq_data,
-            # placeholders for satellite/OSM — replace later with real GEE/Overpass
             "NDVI": 0.4,
             "LST": 28.0,
             "NightLights": 15.0,
@@ -496,7 +485,7 @@ def forecast_future(lat, lon, horizon=3):
     return forecasts
 
 # ======================================================
-# 6. Graph + SHAP generation
+# 5. Graph + SHAP generation (unchanged but safe if explainer None)
 # ======================================================
 def generate_forecast_plot(forecasts):
     times = [f["time"] for f in forecasts]
@@ -517,6 +506,8 @@ def generate_forecast_plot(forecasts):
     return base64.b64encode(buf.read()).decode("utf-8")
 
 def generate_shap_plot(X):
+    if explainer is None:
+        return None
     try:
         shap_vals = explainer(X)
         vals = shap_vals.values[0]
@@ -541,6 +532,8 @@ def generate_shap_plot(X):
         return None
 
 def generate_shap_explanations(X):
+    if explainer is None:
+        return ["Explanation unavailable (explainer loading)"]
     try:
         shap_vals = explainer(X)
         vals = shap_vals.values[0]
@@ -556,7 +549,7 @@ def generate_shap_explanations(X):
         return ["Explanation unavailable"]
 
 # ======================================================
-# 7. FastAPI App
+# 6. FastAPI App + startup resource loader
 # ======================================================
 app = FastAPI(title="AI Nose 3.0 API",
               description="Multimodal Air Pollution Intelligence API with Graphs + SHAP + Open-Meteo",
@@ -568,9 +561,64 @@ class Query(BaseModel):
     horizon: int = 3
     question: str = None
 
+@app.on_event("startup")
+async def load_heavy_resources():
+    """
+    Load model, scaler, explainer, and YOLO in background threads so app startup is fast
+    and the platform proxy doesn't time out / OOM.
+    """
+    global model, scaler_X, explainer, yolo, _resources_loading_error
+    async def _load_all():
+        try:
+            # load model & scaler in thread
+            m = await asyncio.to_thread(joblib.load, MODEL_PATH)
+            s = await asyncio.to_thread(joblib.load, SCALER_X_PATH)
+            # create SHAP explainer in thread (may be heavy)
+            try:
+                exp = await asyncio.to_thread(shap.Explainer, m)
+            except Exception:
+                exp = None  # keep going even if explainer fails
+            # load YOLO weights in thread (heavy download if not present)
+            try:
+                y = await asyncio.to_thread(YOLO, YOLO_WEIGHTS)
+            except Exception:
+                y = None
+
+            # assign to globals
+            model = m
+            scaler_X = s
+            explainer = exp
+            yolo = y
+        except Exception as e:
+            _resources_loading_error = str(e)
+            # keep globals as-is (None) so endpoints can report status
+    # schedule loader but don't block startup
+    asyncio.create_task(_load_all())
+
+@app.get("/")
+def health_check():
+    """
+    Returns quick health + resource-loading status.
+    """
+    return {
+        "status": "ok",
+        "model_loaded": bool(model is not None),
+        "scaler_loaded": bool(scaler_X is not None),
+        "explainer_loaded": bool(explainer is not None),
+        "yolo_loaded": bool(yolo is not None),
+        "resources_loading_error": _resources_loading_error
+    }
+
+# ======================================================
+# 7. Endpoints (unchanged logic but check resources)
+# ======================================================
 @app.post("/chatbot")
 def chatbot_endpoint(query: Query):
     try:
+        # If required model/scaler not ready, return helpful message
+        if model is None or scaler_X is None:
+            return {"status": "loading", "message": "Model or scaler still loading. Try /health to check status."}
+
         intent = detect_intent(query.question) if query.question else "general"
         forecasts = forecast_future(query.lat, query.lon, horizon=query.horizon)
 
@@ -602,12 +650,6 @@ def chatbot_endpoint(query: Query):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
-
-@app.get("/")
-def health_check():
-    return {"status": "ok"}
-
 @app.post("/chatbot_with_image")
 async def chatbot_with_image(
     lat: float = Form(...),
@@ -617,8 +659,14 @@ async def chatbot_with_image(
     file: UploadFile = File(...)
 ):
     try:
+        # Ensure model/scaler ready for predictions; ensure yolo ready for image analysis
+        if model is None or scaler_X is None:
+            return {"status": "loading", "message": "Model or scaler still loading. Try /health to check status."}
+        if yolo is None:
+            return {"status": "loading", "message": "YOLO model still loading. Try /health to check status."}
+
         img_bytes = await file.read()
-        img_analysis = analyze_image(img_bytes)
+        img_analysis = await asyncio.to_thread(analyze_image, img_bytes)
 
         intent = detect_intent(question) if question else "general"
         forecasts = forecast_future(lat, lon, horizon=horizon)
@@ -644,7 +692,6 @@ async def chatbot_with_image(
         image_adj = image_to_adjustment(img_analysis)
         adjusted_pred = float(round(base_pred + image_adj, 2))
 
-        # Optionally adjust the first forecast entry (simple approach)
         if len(forecasts) > 0:
             forecasts[0]["predicted"] = float(round(forecasts[0]["predicted"] + image_adj, 2))
             forecasts[0]["note"] = f"Adjusted by image-derived +{image_adj} µg/m³"
@@ -653,7 +700,6 @@ async def chatbot_with_image(
         shap_graph = generate_shap_plot(X_scaled)
         shap_explanations = generate_shap_explanations(X_scaled)
 
-        # AI-like summary from image
         image_summary = image_summary_from_features(img_analysis)
 
         return {
@@ -684,7 +730,7 @@ async def chatbot_with_image(
                 "firecracker_like": img_analysis.get("firecracker_like"),
                 "detections": img_analysis.get("detections")
             },
-            "annotated_image": img_analysis.get("annotated_image_b64"),  # PNG base64 - prefix with data:image/png;base64, to display
+            "annotated_image": img_analysis.get("annotated_image_b64"),
             "image_summary": image_summary,
             "base_prediction": base_pred,
             "image_adjustment": image_adj,
@@ -697,9 +743,8 @@ async def chatbot_with_image(
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
 # ======================================================
-# 8. Run server
+# 8. Run server (respect $PORT)
 # ======================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))  # use Render's $PORT if available
