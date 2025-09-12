@@ -1,3 +1,8 @@
+# ai_nose_api.py
+# Full updated FastAPI file — keeps your existing logic intact but replaces analyze_image
+# to produce an annotated image (base64) + human-friendly assessment, and updates the
+# /chatbot_with_image endpoint to include these fields and a combined narrative.
+
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form
 from pydantic import BaseModel
@@ -55,31 +60,116 @@ def detect_intent(question: str):
 
 # ======================================================
 # 3. Image analysis (YOLO + OpenCV)
+#    UPDATED: now produces annotated_image (base64 PNG) and image_assessment
 # ======================================================
 yolo = YOLO("yolov8n.pt")
 
 def analyze_image(img_bytes):
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    """
+    Analyze image and return:
+      - vehicle_count (int)
+      - greenery_ratio (float)
+      - haze_score (float)
+      - annotated_image (base64 PNG string) or None
+      - image_assessment (human-readable summary linking features to pollution)
+    """
+    try:
+        # decode bytes -> image
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Could not decode image bytes")
 
-    results = yolo.predict(img, verbose=False)
-    objects = results[0].boxes.cls.cpu().numpy()
+        # YOLO prediction
+        results = yolo.predict(img, verbose=False)[0]
+        boxes = getattr(results, "boxes", None)
 
-    vehicle_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck
-    vehicle_count = sum([obj in vehicle_classes for obj in objects])
+        # vehicle counting (YOLO class mapping: using numeric class ids)
+        cls_arr = boxes.cls.cpu().numpy() if (boxes is not None and hasattr(boxes, "cls")) else np.array([])
+        vehicle_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck
+        vehicle_count = int(sum([int(c) in vehicle_classes for c in cls_arr]))
 
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    green_mask = (hsv[:,:,0] > 35) & (hsv[:,:,0] < 85)
-    greenery_ratio = green_mask.sum() / (img.shape[0]*img.shape[1])
+        # greenery ratio using HSV hue filter (heuristic)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        green_mask = (hsv[:, :, 0] > 35) & (hsv[:, :, 0] < 85)
+        greenery_ratio = float(green_mask.sum()) / (img.shape[0] * img.shape[1])
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    haze_score = gray.std()
+        # haze score: grayscale std-dev (heuristic; lower may indicate haze/fog)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        haze_score = float(np.std(gray))
 
-    return {
-        "vehicle_count": int(vehicle_count),
-        "greenery_ratio": round(float(greenery_ratio), 3),
-        "haze_score": round(float(haze_score), 2)
-    }
+        # Annotate image: draw boxes + labels (if boxes exist)
+        annotated = img.copy()
+        try:
+            if boxes is not None and len(boxes) > 0:
+                xyxy = boxes.xyxy.cpu().numpy()
+                cls_idxs = boxes.cls.cpu().numpy()
+                confs = boxes.conf.cpu().numpy() if hasattr(boxes, "conf") else np.zeros(len(xyxy))
+                # Optionally map numeric classes to names if you have mapping
+                for (x1, y1, x2, y2), cls_idx, conf in zip(xyxy, cls_idxs, confs):
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    # green rectangle
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"{int(cls_idx)} {conf:.2f}"
+                    cv2.putText(annotated, label, (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        except Exception:
+            # annotation failure should not break analysis
+            pass
+
+        # encode annotated -> base64 PNG
+        annotated_b64 = None
+        try:
+            ok, buf = cv2.imencode('.png', annotated)
+            if ok:
+                annotated_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+        except Exception:
+            annotated_b64 = None
+
+        # human-readable assessment linking image features to pollution/drivers
+        assessment_parts = []
+
+        # traffic assessment
+        if vehicle_count >= 8:
+            assessment_parts.append(f"Heavy traffic detected ({vehicle_count} vehicles) — likely a significant local source of PM and NO₂.")
+        elif vehicle_count >= 3:
+            assessment_parts.append(f"Moderate traffic ({vehicle_count} vehicles) — contributes to local pollution.")
+        else:
+            assessment_parts.append(f"Light traffic ({vehicle_count} vehicles) — lower vehicle emissions visible.")
+
+        # vegetation assessment
+        if greenery_ratio >= 0.08:
+            assessment_parts.append(f"Substantial visible vegetation (green ratio {greenery_ratio:.2f}) — may help reduce local PM.")
+        elif greenery_ratio >= 0.03:
+            assessment_parts.append(f"Moderate vegetation (green ratio {greenery_ratio:.2f}).")
+        else:
+            assessment_parts.append(f"Limited vegetation (green ratio {greenery_ratio:.2f}) — less natural filtration.")
+
+        # haze assessment (heuristic thresholds)
+        if haze_score <= 30:
+            assessment_parts.append(f"Image appears hazy (haze score {haze_score:.1f}) — visual indicator of particulate pollution or fog.")
+        elif haze_score <= 60:
+            assessment_parts.append(f"Slight haze visible (haze score {haze_score:.1f}).")
+        else:
+            assessment_parts.append(f"Clear visibility in image (haze score {haze_score:.1f}).")
+
+        image_assessment = " ".join(assessment_parts)
+
+        return {
+            "vehicle_count": int(vehicle_count),
+            "greenery_ratio": round(float(greenery_ratio), 3),
+            "haze_score": round(float(haze_score), 2),
+            "annotated_image": annotated_b64,        # base64 PNG (or None)
+            "image_assessment": image_assessment    # human-readable link to pollution/drivers
+        }
+    except Exception as e:
+        # safe fallback
+        return {
+            "vehicle_count": 0,
+            "greenery_ratio": 0.0,
+            "haze_score": 0.0,
+            "annotated_image": None,
+            "image_assessment": f"Image analysis failed: {str(e)}"
+        }
 
 # ======================================================
 # 4. Advice logic
@@ -292,6 +382,9 @@ def chatbot_endpoint(query: Query):
 def health_check():
     return {"status": "ok"}
 
+# ======================================================
+# UPDATED: chatbot_with_image endpoint — returns annotated image + assessment + combined narrative
+# ======================================================
 @app.post("/chatbot_with_image")
 async def chatbot_with_image(
     lat: float = Form(...),
@@ -302,6 +395,7 @@ async def chatbot_with_image(
 ):
     try:
         img_bytes = await file.read()
+        # analyze_image now returns annotated_image and image_assessment
         img_features = analyze_image(img_bytes)
 
         intent = detect_intent(question) if question else "general"
@@ -327,11 +421,27 @@ async def chatbot_with_image(
         shap_graph = generate_shap_plot(X_scaled)
         shap_explanations = generate_shap_explanations(X_scaled)
 
-        return {"status": "ok", "intent": intent, "img_features": img_features,
-                "results": forecasts,
-                "forecast_graph": forecast_graph,
-                "shap_graph": shap_graph,
-                "shap_explanations": shap_explanations}
+        # Build combined narrative that links forecast narrative + SHAP drivers + image assessment
+        narrative_parts = []
+        if forecasts and len(forecasts) > 0 and forecasts[0].get("narrative"):
+            narrative_parts.append(forecasts[0]["narrative"])
+        if shap_explanations:
+            narrative_parts.append("Top model drivers: " + "; ".join(shap_explanations[:3]))
+        if img_features and img_features.get("image_assessment"):
+            narrative_parts.append("Image assessment: " + img_features["image_assessment"])
+
+        combined_narrative = " ".join(narrative_parts).strip()
+
+        return {
+            "status": "ok",
+            "intent": intent,
+            "img_features": img_features,           # includes annotated_image (base64) + image_assessment
+            "results": forecasts,
+            "forecast_graph": forecast_graph,
+            "shap_graph": shap_graph,
+            "shap_explanations": shap_explanations,
+            "narrative": combined_narrative
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
