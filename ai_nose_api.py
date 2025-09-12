@@ -55,37 +55,100 @@ def detect_intent(question: str):
     return intent_labels[best_idx]
 
 # ======================================================
-# 3. Image analysis (YOLO + OpenCV)
+# 3. Image analysis (YOLO + OpenCV) - expanded
 # ======================================================
 yolo = YOLO("yolov8n.pt")
 
+# Heuristic helpers for fire/smoke/bright flashes/dust
+def detect_fire_color_regions(img, min_area=150, saturation_thr=120, value_thr=150):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lower1 = np.array([0, saturation_thr, value_thr])
+    upper1 = np.array([30, 255, 255])
+    lower2 = np.array([160, saturation_thr, value_thr])
+    upper2 = np.array([179, 255, 255])
+    m1 = cv2.inRange(hsv, lower1, upper1)
+    m2 = cv2.inRange(hsv, lower2, upper2)
+    mask = cv2.bitwise_or(m1, m2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = [c for c in contours if cv2.contourArea(c) >= min_area]
+    mask_frac = mask.sum() / (img.shape[0] * img.shape[1] * 255.0)
+    return len(blobs), float(mask_frac), mask
+
+def detect_smoke_regions(img, min_area=400):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    _, s, v = cv2.split(hsv)
+    sat_mask = (s < 50)
+    v_norm = (v / 255.0)
+    bright_mask = (v_norm > 0.12)
+    candidate = (sat_mask & bright_mask).astype('uint8') * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11,11))
+    candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = [c for c in contours if cv2.contourArea(c) >= min_area]
+    mask_frac = candidate.sum() / (img.shape[0] * img.shape[1] * 255.0)
+    return len(blobs), float(mask_frac), candidate
+
+def detect_bright_flashes(img, small_area=(8, 300), intensity_thresh=245):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, intensity_thresh, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    smalls = [c for c in contours if small_area[0] <= cv2.contourArea(c) <= small_area[1]]
+    return len(smalls), th
+
+def detect_dust_regions(img, min_area=500):
+    # heuristic: tan-ish color + texture
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l, a, b = cv2.split(lab)
+    # dust often high in 'b' channel (yellow-blue) and medium saturation
+    candidate = ((b > 150) & (l > 80)).astype('uint8') * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15,15))
+    candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = [c for c in contours if cv2.contourArea(c) >= min_area]
+    mask_frac = candidate.sum() / (img.shape[0] * img.shape[1] * 255.0)
+    return len(blobs), float(mask_frac), candidate
+
 def analyze_image(img_bytes):
     """
-    Returns:
-      {
-        "vehicle_count": int,
-        "greenery_ratio": float,
-        "haze_score": float,
-        "annotated_image_b64": str,
-        "detections": [ { "class_id": int, "class_name": str, "xyxy": [x1,y1,x2,y2], "conf": float }, ... ]
-      }
+    Returns a comprehensive analysis dictionary including:
+      - detections (YOLO boxes)
+      - detections_by_label (counts)
+      - per-class counts for key classes (vehicle/truck/bus/motorbike)
+      - heuristic masks: smoke_frac, fire_frac, dust_frac, bright_flashes_count
+      - cooking indicators, brick_kiln, smokestack counts (if detected by YOLO)
+      - annotated_image_b64
     """
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Could not decode image bytes")
 
-    # YOLO predict (silent)
+    # YOLO predict
     results = yolo.predict(img, verbose=False)
     r = results[0]
 
     # extract boxes / classes / confidences
     boxes = []
+    names = {i: str(i) for i in range(1000)}
+    try:
+        if hasattr(yolo, "model") and hasattr(yolo.model, "names"):
+            names = yolo.model.names
+    except Exception:
+        pass
+
     if hasattr(r, "boxes") and len(r.boxes):
-        xyxy = r.boxes.xyxy.cpu().numpy()  # N x 4
-        cls_ids = r.boxes.cls.cpu().numpy().astype(int)  # N
-        confs = r.boxes.conf.cpu().numpy() if hasattr(r.boxes, "conf") else [None]*len(cls_ids)
-        names = yolo.model.names if hasattr(yolo.model, "names") else {i: str(i) for i in range(1000)}
+        xyxy = r.boxes.xyxy.cpu().numpy()
+        cls_ids = r.boxes.cls.cpu().numpy().astype(int)
+        confs = None
+        if hasattr(r.boxes, "conf"):
+            try:
+                confs = r.boxes.conf.cpu().numpy()
+            except Exception:
+                confs = None
         for i in range(len(cls_ids)):
             boxes.append({
                 "class_id": int(cls_ids[i]),
@@ -94,22 +157,87 @@ def analyze_image(img_bytes):
                 "conf": float(confs[i]) if confs is not None else None
             })
 
-    # Count vehicles using common COCO class ids
-    vehicle_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck (COCO)
-    vehicle_count = sum(1 for b in boxes if b["class_id"] in vehicle_classes)
+    # build detections_by_label
+    detections_by_label = {}
+    for b in boxes:
+        nm = b["class_name"]
+        detections_by_label[nm] = detections_by_label.get(nm, 0) + 1
 
-    # Greenery ratio from HSV
+    # per-class counts (legacy + extended)
+    vehicle_class_ids = [2,3,5,7]  # car, motorbike, bus, truck (COCO)
+    vehicle_count = sum(1 for b in boxes if b["class_id"] in vehicle_class_ids)
+    car_count = sum(1 for b in boxes if b["class_id"] == 2)
+    motorbike_count = sum(1 for b in boxes if b["class_id"] == 3)
+    bus_count = sum(1 for b in boxes if b["class_id"] == 5)
+    truck_count = sum(1 for b in boxes if b["class_id"] == 7)
+
+    # detect presence of domain-specific labels by name substrings (for custom YOLOs)
+    def count_name_contains(subs):
+        c = 0
+        for nm in detections_by_label:
+            nml = nm.lower()
+            for s in subs:
+                if s in nml:
+                    c += detections_by_label[nm]
+                    break
+        return c
+
+    brick_kiln_count = count_name_contains(["kiln", "brick"])
+    smokestack_count = count_name_contains(["smokestack", "smoke", "stack", "chimney", "flare"])
+    generator_count = count_name_contains(["generator", "genset", "genny"])
+    cooking_count = count_name_contains(["stove", "pan", "pot", "tandoor", "grill", "barbecue", "kitchen", "cooking"])
+    construction_machinery_count = count_name_contains(["excavator", "bulldozer", "loader", "backhoe", "dump", "crane"])
+
+    # greenery ratio
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     green_mask = (hsv[:,:,0] > 35) & (hsv[:,:,0] < 85)
     greenery_ratio = float(green_mask.sum() / (img.shape[0]*img.shape[1]))
 
-    # haze_score = simple metric: image gray stddev (lower std -> more haze)
+    # haze_score (gray std)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     haze_score = float(gray.std())
 
-    # Draw annotated image (OpenCV)
+    # heuristic masks
+    fire_blobs, fire_mask_frac, fire_mask = detect_fire_color_regions(img)
+    smoke_blobs, smoke_mask_frac, smoke_mask = detect_smoke_regions(img)
+    bright_count, bright_mask = detect_bright_flashes(img)
+    dust_blobs, dust_mask_frac, dust_mask = detect_dust_regions(img)
+
+    fire_detected = (fire_blobs > 0) or (fire_mask_frac > 0.003)
+    smoke_detected = (smoke_blobs > 0) or (smoke_mask_frac > 0.006)
+    dust_detected = (dust_blobs > 0) or (dust_mask_frac > 0.004)
+    firecracker_like = (bright_count >= 1) and smoke_detected
+
+    # open burn heuristic: fire + smoke + not inside cooking
+    open_burn_detected = bool(fire_detected and smoke_detected and (cooking_count == 0))
+
+    # Draw annotated image
     annotated = img.copy()
     h, w = annotated.shape[:2]
+
+    # overlay masks lightly (optional): smoke in gray, fire in orange, dust in tan
+    try:
+        # convert single channel masks to 3-channel for overlay
+        if smoke_mask is not None:
+            sm_rgb = cv2.cvtColor(smoke_mask, cv2.COLOR_GRAY2BGR)
+            annotated = cv2.addWeighted(annotated, 1.0, (sm_rgb // 2), 0.25, 0)
+        if fire_mask is not None:
+            fm = (fire_mask > 0).astype('uint8') * 255
+            fm_rgb = cv2.cvtColor(fm, cv2.COLOR_GRAY2BGR)
+            # paint fire mask using orange color
+            orange = np.zeros_like(annotated)
+            orange[:,:,2] = fm  # red channel
+            orange[:,:,1] = (fm * 0.6).astype('uint8')  # green
+            annotated = cv2.addWeighted(annotated, 1.0, orange, 0.25, 0)
+        if dust_mask is not None:
+            dm = (dust_mask > 0).astype('uint8') * 255
+            brown = np.zeros_like(annotated)
+            brown[:,:,2] = (dm * 0.9).astype('uint8')  # hint of red/yellow
+            brown[:,:,1] = (dm * 0.7).astype('uint8')
+            annotated = cv2.addWeighted(annotated, 1.0, brown, 0.12, 0)
+    except Exception:
+        # overlay is optional; proceed if fails
+        pass
 
     # Draw boxes + labels
     for b in boxes:
@@ -117,77 +245,158 @@ def analyze_image(img_bytes):
         cls_name = b["class_name"]
         conf = b.get("conf", None)
         label = f"{cls_name}" + (f" {conf:.2f}" if conf is not None else "")
-        # rectangle and filled label background
         cv2.rectangle(annotated, (x1,y1), (x2,y2), (0, 255, 255), 2)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         cv2.rectangle(annotated, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), (0,255,255), -1)
-        cv2.putText(annotated, label, (x1+3, max(4, y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+        cv2.putText(annotated, label, (x1+3, max(4, y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1, cv2.LINE_AA)
 
-    # Header with quick stats
-    header = f"Vehicles: {vehicle_count}  Greenery: {greenery_ratio:.2f}  HazeScore: {haze_score:.1f}"
-    cv2.rectangle(annotated, (0,0), (w, 28), (0,0,0), -1)
-    cv2.putText(annotated, header, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
+    # Header with many quick stats
+    header = (f"V:{vehicle_count} C:{car_count} T:{truck_count} M:{motorbike_count} "
+              f"Smoke:{smoke_mask_frac:.3f} Fire:{fire_mask_frac:.3f} Dust:{dust_mask_frac:.3f}")
+    cv2.rectangle(annotated, (0,0), (w, 36), (0,0,0), -1)
+    cv2.putText(annotated, header, (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
 
     # encode annotated image to base64
     _, buf = cv2.imencode('.png', annotated)
     annotated_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
 
     return {
+        "detections": boxes,
+        "detections_by_label": detections_by_label,
         "vehicle_count": int(vehicle_count),
+        "car_count": int(car_count),
+        "truck_count": int(truck_count),
+        "bus_count": int(bus_count),
+        "motorbike_count": int(motorbike_count),
+        "brick_kiln_count": int(brick_kiln_count),
+        "smokestack_count": int(smokestack_count),
+        "generator_count": int(generator_count),
+        "cooking_count": int(cooking_count),
+        "construction_machinery_count": int(construction_machinery_count),
         "greenery_ratio": round(float(greenery_ratio), 3),
         "haze_score": round(float(haze_score), 2),
-        "annotated_image_b64": annotated_b64,
-        "detections": boxes
+        "fire_blobs": int(fire_blobs),
+        "fire_mask_frac": round(float(fire_mask_frac), 6),
+        "smoke_blobs": int(smoke_blobs),
+        "smoke_mask_frac": round(float(smoke_mask_frac), 6),
+        "dust_blobs": int(dust_blobs),
+        "dust_mask_frac": round(float(dust_mask_frac), 6),
+        "bright_flash_count": int(bright_count),
+        "fire_detected": bool(fire_detected),
+        "smoke_detected": bool(smoke_detected),
+        "dust_detected": bool(dust_detected),
+        "firecracker_like": bool(firecracker_like),
+        "open_burn_detected": bool(open_burn_detected),
+        "annotated_image_b64": annotated_b64
     }
 
-# --- Helper: create short AI-like summary from image features + detections ---
-def image_summary_from_features(img_features, max_items=3):
+# --- Helper: image summary considering many detections ---
+def image_summary_from_features(img_features, max_items=4):
     parts = []
+    # strong signals first
+    if img_features.get("open_burn_detected"):
+        parts.append("Open burning detected — strong local source of particulate emissions.")
+    if img_features.get("smoke_detected"):
+        parts.append(f"Smoke plume visible (frac={img_features.get('smoke_mask_frac'):.4f}).")
+    if img_features.get("fire_detected"):
+        parts.append("Flame-like regions detected — active combustion present.")
+    if img_features.get("firecracker_like"):
+        parts.append("Bright small flashes + smoke — fireworks or firecrackers likely.")
+    # vehicles & industrial
     vc = img_features.get("vehicle_count", 0)
-    gr = img_features.get("greenery_ratio", 0.0)
-    hz = img_features.get("haze_score", 0.0)
     if vc > 0:
-        parts.append(f"{vc} motor vehicles detected — likely local traffic emissions (NO₂, CO, PM).")
-    if gr < 0.2:
-        parts.append(f"Low visible greenery ({gr:.2f}) — reduced natural particulate removal.")
+        parts.append(f"{vc} vehicle(s) visible — traffic emissions likely.")
+    if img_features.get("truck_count", 0) > 0:
+        parts.append(f"{img_features.get('truck_count')} heavy vehicle(s) (trucks) — diesel source.")
+    if img_features.get("brick_kiln_count", 0) > 0 or img_features.get("smokestack_count", 0) > 0:
+        parts.append("Industrial chimney/brick-kiln features detected — point-source emissions probable.")
+    if img_features.get("construction_machinery_count", 0) > 0 or img_features.get("dust_detected"):
+        parts.append("Construction/dust activity detected — coarse particulate contribution.")
+    if img_features.get("cooking_count", 0) > 0:
+        parts.append("Cooking/food stalls visible — localized PM and VOCs possible.")
+    # greenery
+    gr = img_features.get("greenery_ratio", 0.0)
+    if gr < 0.15:
+        parts.append(f"Low greenery ({gr:.2f}) — limited natural mitigation.")
     else:
-        parts.append(f"Moderate greenery visible ({gr:.2f}) — some natural mitigation.")
-    # interpret haze score heuristically
-    if hz < 30:
-        parts.append("Low contrast/haze level — scene appears clear.")
-    elif hz < 70:
-        parts.append("Moderate haze — possible fine particles or humidity.")
-    else:
-        parts.append("High haze/low contrast — visual indicator of particulate pollution or fog.")
-    # keep it short + actionable
+        parts.append(f"Greenery present ({gr:.2f}) — some mitigation.")
+    suggestion = "Recommendation: verify with sensor readings; reduce open burning and heavy traffic if possible."
     summary = " ".join(parts[:max_items])
-    suggestion = "Recommendation: reduce local traffic, check industrial sources, and monitor meteorology."
     return f"{summary} {suggestion}"
 
-# --- Helper: map image features to a small numeric adjustment (heuristic) ---
+# --- Helper: map a rich set of image features to a numeric µg/m³ adjustment ---
 def image_to_adjustment(img_features):
     """
-    Produce a small µg/m³ adjustment to add to the model prediction.
-    This is a heuristic fallback so image features contribute now.
-    Recommended: retrain model to include these features for principled results.
+    Conservative heuristic mapping many visual signals -> µg/m³ adjustment.
+    Tunable; recommended retraining with these features for principled integration.
     """
-    vc = img_features.get("vehicle_count", 0)
-    gr = img_features.get("greenery_ratio", 0.0)
-    hz = img_features.get("haze_score", 0.0)
+    # Extract features with sensible defaults
+    vc = float(img_features.get("vehicle_count", 0))
+    truck = float(img_features.get("truck_count", 0))
+    bus = float(img_features.get("bus_count", 0))
+    motor = float(img_features.get("motorbike_count", 0))
+    smoke_frac = float(img_features.get("smoke_mask_frac", 0.0))
+    fire_frac = float(img_features.get("fire_mask_frac", 0.0))
+    dust_frac = float(img_features.get("dust_mask_frac", 0.0))
+    open_burn = 1.0 if img_features.get("open_burn_detected", False) else 0.0
+    brick = float(img_features.get("brick_kiln_count", 0))
+    chimney = float(img_features.get("smokestack_count", 0))
+    gen = float(img_features.get("generator_count", 0))
+    cooking = float(img_features.get("cooking_count", 0))
+    bright = float(img_features.get("bright_flash_count", 0))
+    greenery = float(img_features.get("greenery_ratio", 0.0))
 
-    # Heuristic scales (tunable)
-    # - vehicles increase PM2.5 roughly proportionally
-    veh_score = vc * 0.9            # each vehicle adds ~0.9 units (tunable)
-    # - low greenery increases PM by (0.4 - gr) * scale
-    greenery_score = max(0.0, (0.4 - gr)) * 25.0   # baseline 0.4
-    # - haze_score: lower std -> more haze, so invert
-    haze_penalty = max(0.0, 50.0 - hz) * 0.2
+    # Normalize counts to avoid large raw values
+    vc_norm = vc / 10.0           # per 10 vehicles
+    truck_norm = truck / 2.0      # each 2 trucks ~ 1 unit
+    bus_norm = bus / 2.0
+    motor_norm = motor / 10.0
+    brick_norm = brick / 1.0
+    chimney_norm = chimney / 1.0
+    gen_norm = gen / 1.0
+    cooking_norm = cooking / 2.0
+    bright_norm = bright / 1.0
 
-    image_score = veh_score + greenery_score + haze_penalty
+    # Weights (conservative). These can be tuned with validation data.
+    W = {
+        "vc": 0.6,
+        "truck": 1.2,
+        "bus": 1.0,
+        "motor": 0.35,
+        "smoke_frac": 55.0,
+        "fire_frac": 65.0,
+        "dust_frac": 25.0,
+        "open_burn": 30.0,
+        "brick": 40.0,
+        "chimney": 25.0,
+        "gen": 8.0,
+        "cooking": 6.0,
+        "bright": 10.0,
+        "greenery": -18.0
+    }
 
-    # map to µg/m3; conservative multiplier
-    adjustment = image_score * 0.35
-    return float(round(adjustment, 2))
+    score = 0.0
+    score += W["vc"] * vc_norm
+    score += W["truck"] * truck_norm
+    score += W["bus"] * bus_norm
+    score += W["motor"] * motor_norm
+    score += W["smoke_frac"] * smoke_frac
+    score += W["fire_frac"] * fire_frac
+    score += W["dust_frac"] * dust_frac
+    score += W["open_burn"] * open_burn
+    score += W["brick"] * brick_norm
+    score += W["chimney"] * chimney_norm
+    score += W["gen"] * gen_norm
+    score += W["cooking"] * cooking_norm
+    score += W["bright"] * bright_norm
+    score += W["greenery"] * greenery
+
+    # Convert score -> µg/m3 adjustment using conservative multiplier
+    adjustment = score * 0.28
+
+    # Clip to safe bounds to avoid huge swings
+    adjustment = float(np.clip(adjustment, -25.0, 120.0))
+    return round(adjustment, 2)
 
 # ======================================================
 # 4. Advice logic
@@ -451,12 +660,31 @@ async def chatbot_with_image(
             "status": "ok",
             "intent": intent,
             "img_features": {
-                "vehicle_count": img_analysis["vehicle_count"],
-                "greenery_ratio": img_analysis["greenery_ratio"],
-                "haze_score": img_analysis["haze_score"],
-                "detections": img_analysis["detections"]
+                "detections_by_label": img_analysis.get("detections_by_label"),
+                "vehicle_count": img_analysis.get("vehicle_count"),
+                "car_count": img_analysis.get("car_count"),
+                "truck_count": img_analysis.get("truck_count"),
+                "bus_count": img_analysis.get("bus_count"),
+                "motorbike_count": img_analysis.get("motorbike_count"),
+                "brick_kiln_count": img_analysis.get("brick_kiln_count"),
+                "smokestack_count": img_analysis.get("smokestack_count"),
+                "generator_count": img_analysis.get("generator_count"),
+                "cooking_count": img_analysis.get("cooking_count"),
+                "construction_machinery_count": img_analysis.get("construction_machinery_count"),
+                "greenery_ratio": img_analysis.get("greenery_ratio"),
+                "haze_score": img_analysis.get("haze_score"),
+                "smoke_mask_frac": img_analysis.get("smoke_mask_frac"),
+                "fire_mask_frac": img_analysis.get("fire_mask_frac"),
+                "dust_mask_frac": img_analysis.get("dust_mask_frac"),
+                "bright_flash_count": img_analysis.get("bright_flash_count"),
+                "fire_detected": img_analysis.get("fire_detected"),
+                "smoke_detected": img_analysis.get("smoke_detected"),
+                "dust_detected": img_analysis.get("dust_detected"),
+                "open_burn_detected": img_analysis.get("open_burn_detected"),
+                "firecracker_like": img_analysis.get("firecracker_like"),
+                "detections": img_analysis.get("detections")
             },
-            "annotated_image": img_analysis["annotated_image_b64"],  # PNG base64 - prefix with data:image/png;base64, to display
+            "annotated_image": img_analysis.get("annotated_image_b64"),  # PNG base64 - prefix with data:image/png;base64, to display
             "image_summary": image_summary,
             "base_prediction": base_pred,
             "image_adjustment": image_adj,
